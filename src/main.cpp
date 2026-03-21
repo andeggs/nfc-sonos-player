@@ -1,13 +1,17 @@
 #include <Arduino.h>
 /*
- * nfc_spotify_sonos.ino
+ * main.cpp — NFC Sonos Player
  *
  * Scans an NFC tag, reads its NDEF URL, parses it as a Spotify link,
  * and plays the track / album / artist on a Sonos speaker via UPnP/SOAP.
  *
- * Power optimisations:
- *   - Light sleep between RC522 polls (~50mA idle vs ~220mA always-on)
- *   - WiFi connected on demand only, disconnected after playback command sent
+ * Power strategy:
+ *   - Light sleep between RC522 polls when WiFi is off
+ *   - WiFi connects on first tag scan
+ *   - WiFi stays on for 15 minutes (WIFI_KEEPALIVE_MS) to allow quick
+ *     successive tag scans without reconnect delay
+ *   - After 15 minutes of inactivity, ESP.restart() fully powers down
+ *     the WiFi radio and returns to low-power light sleep polling
  *
  * Supported tag types : NTAG213 / NTAG215 / NTAG216, MIFARE Classic
  * Supported Spotify   : track, album, artist (top tracks)
@@ -21,8 +25,8 @@
  *   RC522 3.3V → 3.3V  (NOT 5V)
  *   RC522 GND  → GND
  *
- * Dependencies (Library Manager):
- *   MFRC522 by GithubCommunity
+ * Dependencies (platformio.ini lib_deps):
+ *   miguelbalboa/MFRC522@^1.4.10
  */
 
 #include <SPI.h>
@@ -30,26 +34,22 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include "esp_sleep.h"
+#include "secrets.h"
 
-// ── Configuration ─────────────────────────────────────────────────────────────
-
-const char* WIFI_SSID     = "PLUSNET-TJCKR6";
-const char* WIFI_PASSWORD = "";
-const char* SONOS_IP      = "192.168.1.132";
-const char* SONOS_UDN     = "RINCON_5CAAFD9D685201400";
-const char* SONOS_TOKEN   = "SA_RINCON2311_X_#Svc2311-5546f4c4-Token";
-const int   SPOTIFY_SN    = 11;
+// ── Power configuration ───────────────────────────────────────────────────────
 
 // How often (ms) to wake from light sleep and poll the RC522 for a tag.
-// 150ms gives snappy response while barely registering on power draw.
 const uint32_t POLL_INTERVAL_MS = 150;
 
-// How long (ms) to ignore the same UID after a successful read.
-// Prevents the same tag retriggering while held near the reader.
-const unsigned long DEBOUNCE_MS = 5000;
+// How long WiFi stays on after the last successful tag scan before the
+// ESP32 restarts and returns to low-power polling.
+const unsigned long WIFI_KEEPALIVE_MS = 15UL * 60UL * 1000UL; // 15 minutes
 
 // How long (ms) to wait for WiFi to connect before giving up.
 const unsigned long WIFI_TIMEOUT_MS = 15000;
+
+// How long (ms) to ignore the same UID after a successful read.
+const unsigned long DEBOUNCE_MS = 5000;
 
 // ── RC522 pin definitions ─────────────────────────────────────────────────────
 
@@ -65,11 +65,12 @@ const unsigned long WIFI_TIMEOUT_MS = 15000;
 
 MFRC522 mfrc522(SS_PIN, RST_PIN);
 
-// ── Last-seen UID (for debounce) ──────────────────────────────────────────────
+// ── State ─────────────────────────────────────────────────────────────────────
 
 static uint8_t       lastUID[10];
-static uint8_t       lastUIDLen   = 0;
-static unsigned long lastReadTime = 0;
+static uint8_t       lastUIDLen      = 0;
+static unsigned long lastReadTime    = 0;
+static unsigned long wifiConnectedAt = 0;  // 0 = WiFi not yet brought up
 
 // ── URI prefix table ──────────────────────────────────────────────────────────
 
@@ -136,20 +137,19 @@ struct SpotifyItem {
 // =============================================================================
 
 // Power / WiFi
-void       lightSleepMs(uint32_t ms);
-bool       wifiConnect();
-void       wifiDisconnect();
+void        lightSleepMs(uint32_t ms);
+bool        wifiConnect();
 
 // NFC
-bool       readNDEFFromUltralight(uint8_t* buf, uint16_t* len);
-bool       readNDEFFromClassic(uint8_t* buf, uint16_t* len);
-bool       parseTLV(const uint8_t* buf, uint16_t bufLen, uint8_t* ndefBuf, uint16_t* ndefLen);
-NDEFResult parseNDEF(const uint8_t* ndef, uint16_t ndefLen);
-bool       isUltralightFamily();
-bool       isClassicFamily();
-bool       isSameUID(const uint8_t* uid, uint8_t uidLen);
-void       saveUID(const uint8_t* uid, uint8_t uidLen);
-void       printUID();
+bool        readNDEFFromUltralight(uint8_t* buf, uint16_t* len);
+bool        readNDEFFromClassic(uint8_t* buf, uint16_t* len);
+bool        parseTLV(const uint8_t* buf, uint16_t bufLen, uint8_t* ndefBuf, uint16_t* ndefLen);
+NDEFResult  parseNDEF(const uint8_t* ndef, uint16_t ndefLen);
+bool        isUltralightFamily();
+bool        isClassicFamily();
+bool        isSameUID(const uint8_t* uid, uint8_t uidLen);
+void        saveUID(const uint8_t* uid, uint8_t uidLen);
+void        printUID();
 
 // Spotify / Sonos
 SpotifyItem parseSpotifyInput(String input);
@@ -179,9 +179,12 @@ void setup() {
   Serial.println("  NFC → Spotify → Sonos");
   Serial.println("=============================");
 
-  // WiFi is intentionally not started here.
-  // It will be connected on demand when a tag is read.
-  Serial.println("WiFi: on-demand (connects when tag detected)");
+  // Initialise WiFi driver in station mode but do not connect yet.
+  // Connection happens on demand when the first tag is scanned.
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);
+  delay(100);
+  Serial.println("WiFi: on-demand, 15 min keepalive after first tag.");
 
   // ── RC522 ──────────────────────────────────────────────────────────────────
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
@@ -194,8 +197,8 @@ void setup() {
     while (true) delay(1000);
   }
   Serial.printf("✅ RC522 firmware 0x%02X ready.\n", version);
-  Serial.printf("Polling every %dms via light sleep.\n", POLL_INTERVAL_MS);
-  Serial.println("\nHold an NFC tag near the reader...\n");
+  Serial.printf("Polling every %dms via light sleep.\n\n", POLL_INTERVAL_MS);
+  Serial.println("Hold an NFC tag near the reader...\n");
 }
 
 // =============================================================================
@@ -203,9 +206,20 @@ void setup() {
 // =============================================================================
 
 void loop() {
+  // ── WiFi keepalive expiry check ───────────────────────────────────────────
+  // If WiFi has been up for more than WIFI_KEEPALIVE_MS with no tag scan,
+  // restart the ESP32 to fully power down the radio and return to low-power
+  // light sleep polling.
+  if (wifiConnectedAt > 0 &&
+      (millis() - wifiConnectedAt) > WIFI_KEEPALIVE_MS) {
+    Serial.println("⏱  15 min keepalive expired — restarting to save power.");
+    Serial.flush();
+    delay(100);
+    ESP.restart();
+  }
+
   // ── Poll the RC522 ────────────────────────────────────────────────────────
-  // If no card is present, sleep for POLL_INTERVAL_MS and try again.
-  // SPI and RC522 state survive light sleep — no reinitialisation needed.
+  // Light sleep between polls — SPI and RC522 state survive intact.
   if (!mfrc522.PICC_IsNewCardPresent()) {
     lightSleepMs(POLL_INTERVAL_MS);
     return;
@@ -259,7 +273,6 @@ void loop() {
   {
     // ── Parse NDEF ──────────────────────────────────────────────────────────
     NDEFResult ndef = parseNDEF(ndefBuf, ndefLen);
-
     if (!ndef.success) {
       Serial.printf("⚠️  NDEF parse issue: %s\n", ndef.errorMsg);
       goto cleanup;
@@ -269,7 +282,6 @@ void loop() {
 
     // ── Parse as Spotify URL ────────────────────────────────────────────────
     SpotifyItem item = parseSpotifyInput(String(ndef.url));
-
     if (!item.valid) {
       Serial.println("⚠️  Not a recognised Spotify track/album/artist link.");
       goto cleanup;
@@ -277,16 +289,18 @@ void loop() {
 
     Serial.printf("Spotify %s → %s\n", item.type.c_str(), item.id.c_str());
 
-    // ── Connect WiFi, play, disconnect ──────────────────────────────────────
-    // WiFi is only needed for the SOAP call — bring it up now and tear it
-    // down immediately afterwards to keep idle current low.
+    // ── Connect WiFi if needed ──────────────────────────────────────────────
     if (!wifiConnect()) {
       Serial.println("❌ Could not connect to WiFi — playback skipped.");
       goto cleanup;
     }
 
+    // Reset keepalive timer on every successful tag scan
+    wifiConnectedAt = millis();
+    Serial.println("⏱  Keepalive reset — WiFi stays on for 15 min.");
+
+    // ── Play on Sonos ───────────────────────────────────────────────────────
     playSpotifyItem(item);
-    wifiDisconnect();
   }
 
 cleanup:
@@ -299,11 +313,8 @@ cleanup:
 // POWER — LIGHT SLEEP
 // =============================================================================
 
-// Put the ESP32 into light sleep for the given number of milliseconds.
-// Peripherals (SPI, RC522) are unaffected — they resume exactly as left.
-// millis() continues to increment during sleep.
 void lightSleepMs(uint32_t ms) {
-  esp_sleep_enable_timer_wakeup((uint64_t)ms * 1000ULL); // arg is microseconds
+  esp_sleep_enable_timer_wakeup((uint64_t)ms * 1000ULL);
   esp_light_sleep_start();
 }
 
@@ -312,7 +323,13 @@ void lightSleepMs(uint32_t ms) {
 // =============================================================================
 
 bool wifiConnect() {
-  if (WiFi.status() == WL_CONNECTED) return true;
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi already connected.");
+    return true;
+  }
+
+  WiFi.disconnect(false);
+  delay(100);
 
   Serial.print("Connecting to WiFi");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -321,7 +338,6 @@ bool wifiConnect() {
   while (WiFi.status() != WL_CONNECTED) {
     if (millis() - start > WIFI_TIMEOUT_MS) {
       Serial.println(" ❌ timeout.");
-      WiFi.disconnect(true);
       return false;
     }
     delay(250);
@@ -330,12 +346,6 @@ bool wifiConnect() {
 
   Serial.printf(" connected (%s)\n", WiFi.localIP().toString().c_str());
   return true;
-}
-
-void wifiDisconnect() {
-  WiFi.disconnect(true);   // true = also clears SSID/password from RAM
-  WiFi.mode(WIFI_OFF);
-  Serial.println("WiFi off.");
 }
 
 // =============================================================================
@@ -357,7 +367,6 @@ bool readNDEFFromUltralight(uint8_t* buf, uint16_t* len) {
     for (uint8_t b = 0; b < 4 && *len < MAX_NDEF_BYTES; b++)
       buf[(*len)++] = pageData[b];
 
-    // Stop early at NDEF terminator
     for (uint8_t b = (*len >= 4) ? *len - 4 : 0; b < *len; b++)
       if (buf[b] == 0xFE) return true;
   }
@@ -490,9 +499,9 @@ NDEFResult parseNDEF(const uint8_t* ndef, uint16_t ndefLen) {
       snprintf(result.errorMsg, sizeof(result.errorMsg), "Empty URI payload");
       return result;
     }
-    uint8_t    prefixCode = payload[0];
-    const char* prefix    = (prefixCode < URI_PREFIX_COUNT) ? URI_PREFIXES[prefixCode] : "";
-    uint32_t   suffixLen  = payloadLen - 1;
+    uint8_t     prefixCode = payload[0];
+    const char* prefix     = (prefixCode < URI_PREFIX_COUNT) ? URI_PREFIXES[prefixCode] : "";
+    uint32_t    suffixLen  = payloadLen - 1;
     snprintf(result.url, sizeof(result.url), "%s%.*s",
              prefix,
              (int)min(suffixLen, (uint32_t)(sizeof(result.url) - strlen(prefix) - 1)),
@@ -577,7 +586,7 @@ SpotifyItem parseSpotifyInput(String input) {
     input.replace(":", "/");
   }
 
-  int slash = input.indexOf('/');
+  int slash  = input.indexOf('/');
   if (slash == -1) return item;
 
   item.type   = input.substring(0, slash);
