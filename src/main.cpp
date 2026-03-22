@@ -13,6 +13,13 @@
  *   - After 15 minutes of inactivity, ESP.restart() fully powers down
  *     the WiFi radio and returns to low-power light sleep polling
  *
+ * Crash diagnostics:
+ *   - Reset reason printed on every boot
+ *   - Core dump location reported if present
+ *   - Stack high water mark logged every 30 seconds
+ *   - Run monitor with esp32_exception_decoder filter to decode backtraces:
+ *       pio device monitor --baud 115200 --filter esp32_exception_decoder
+ *
  * Supported tag types : NTAG213 / NTAG215 / NTAG216, MIFARE Classic
  * Supported Spotify   : track, album, artist (top tracks)
  *
@@ -34,6 +41,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include "esp_sleep.h"
+#include "esp_core_dump.h"
 #include "secrets.h"
 
 // ── Power configuration ───────────────────────────────────────────────────────
@@ -50,6 +58,9 @@ const unsigned long WIFI_TIMEOUT_MS = 15000;
 
 // How long (ms) to ignore the same UID after a successful read.
 const unsigned long DEBOUNCE_MS = 5000;
+
+// How often (ms) to print stack high water mark diagnostics.
+const unsigned long STACK_CHECK_INTERVAL_MS = 30000;
 
 // ── RC522 pin definitions ─────────────────────────────────────────────────────
 
@@ -70,7 +81,8 @@ MFRC522 mfrc522(SS_PIN, RST_PIN);
 static uint8_t       lastUID[10];
 static uint8_t       lastUIDLen      = 0;
 static unsigned long lastReadTime    = 0;
-static unsigned long wifiConnectedAt = 0;  // 0 = WiFi not yet brought up
+static unsigned long wifiConnectedAt = 0;
+static unsigned long lastStackCheck  = 0;
 
 // ── URI prefix table ──────────────────────────────────────────────────────────
 
@@ -136,6 +148,11 @@ struct SpotifyItem {
 // FORWARD DECLARATIONS
 // =============================================================================
 
+// Diagnostics
+void        printResetReason();
+void        printCoreDumpSummary();
+void        printStackWatermarks();
+
 // Power / WiFi
 void        lightSleepMs(uint32_t ms);
 bool        wifiConnect();
@@ -179,8 +196,13 @@ void setup() {
   Serial.println("  NFC → Spotify → Sonos");
   Serial.println("=============================");
 
-  // Initialise WiFi driver in station mode but do not connect yet.
-  // Connection happens on demand when the first tag is scanned.
+  // ── Crash diagnostics — always print on every boot ───────────────────────
+  printResetReason();
+  printCoreDumpSummary();
+  printStackWatermarks();
+  Serial.println();
+
+  // ── WiFi — initialise driver but do not connect yet ───────────────────────
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);
   delay(100);
@@ -206,10 +228,13 @@ void setup() {
 // =============================================================================
 
 void loop() {
+  // ── Periodic stack check ──────────────────────────────────────────────────
+  if (millis() - lastStackCheck > STACK_CHECK_INTERVAL_MS) {
+    printStackWatermarks();
+    lastStackCheck = millis();
+  }
+
   // ── WiFi keepalive expiry check ───────────────────────────────────────────
-  // If WiFi has been up for more than WIFI_KEEPALIVE_MS with no tag scan,
-  // restart the ESP32 to fully power down the radio and return to low-power
-  // light sleep polling.
   if (wifiConnectedAt > 0 &&
       (millis() - wifiConnectedAt) > WIFI_KEEPALIVE_MS) {
     Serial.println("⏱  15 min keepalive expired — restarting to save power.");
@@ -218,16 +243,23 @@ void loop() {
     ESP.restart();
   }
 
-  // ── Poll the RC522 ────────────────────────────────────────────────────────
-  // Light sleep between polls — SPI and RC522 state survive intact.
-  if (!mfrc522.PICC_IsNewCardPresent()) {
-    lightSleepMs(POLL_INTERVAL_MS);
-    return;
+// ── Poll the RC522 ────────────────────────────────────────────────────────
+if (!mfrc522.PICC_IsNewCardPresent()) {
+  if (wifiConnectedAt == 0) {
+    lightSleepMs(POLL_INTERVAL_MS);  // WiFi not yet started — full light sleep
+  } else {
+    delay(POLL_INTERVAL_MS);         // WiFi active — just delay to keep it alive
   }
-  if (!mfrc522.PICC_ReadCardSerial()) {
+  return;
+}
+if (!mfrc522.PICC_ReadCardSerial()) {
+  if (wifiConnectedAt == 0) {
     lightSleepMs(POLL_INTERVAL_MS);
-    return;
+  } else {
+    delay(POLL_INTERVAL_MS);
   }
+  return;
+}
 
   // ── Debounce ──────────────────────────────────────────────────────────────
   unsigned long now = millis();
@@ -307,6 +339,49 @@ cleanup:
   Serial.println();
   mfrc522.PICC_HaltA();
   mfrc522.PCD_StopCrypto1();
+}
+
+// =============================================================================
+// DIAGNOSTICS
+// =============================================================================
+
+void printResetReason() {
+  esp_reset_reason_t reason = esp_reset_reason();
+  Serial.print("Reset reason : ");
+  switch (reason) {
+    case ESP_RST_POWERON:  Serial.println("Power on / EN button"); break;
+    case ESP_RST_SW:       Serial.println("Software restart (ESP.restart())"); break;
+    case ESP_RST_PANIC:    Serial.println("⚠️  Exception / panic crash"); break;
+    case ESP_RST_INT_WDT:  Serial.println("⚠️  Interrupt watchdog timeout"); break;
+    case ESP_RST_TASK_WDT: Serial.println("⚠️  Task watchdog timeout"); break;
+    case ESP_RST_WDT:      Serial.println("⚠️  Other watchdog timeout"); break;
+    case ESP_RST_BROWNOUT: Serial.println("⚠️  Brownout — low battery or power issue"); break;
+    case ESP_RST_SDIO:     Serial.println("SDIO reset"); break;
+    default:               Serial.printf("Unknown (%d)\n", reason); break;
+  }
+}
+
+void printCoreDumpSummary() {
+  size_t size = 0;
+  size_t addr = 0;
+  if (esp_core_dump_image_get(&addr, &size) == ESP_OK) {
+    Serial.printf("Core dump   : found at 0x%08X (%d bytes)\n", addr, size);
+    Serial.println("             Decode with:");
+    Serial.println("             pio device monitor --baud 115200 --filter esp32_exception_decoder");
+  } else {
+    Serial.println("Core dump   : none");
+  }
+}
+
+void printStackWatermarks() {
+  UBaseType_t remaining = uxTaskGetStackHighWaterMark(NULL);
+  Serial.printf("Stack HWM   : %u bytes remaining", remaining);
+  if (remaining < 512) {
+    Serial.print("  ⚠️  CRITICALLY LOW");
+  } else if (remaining < 1024) {
+    Serial.print("  ⚠️  low — watch this");
+  }
+  Serial.println();
 }
 
 // =============================================================================
